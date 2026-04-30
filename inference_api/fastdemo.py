@@ -1,238 +1,212 @@
-from fastapi import FastAPI, UploadFile, File
+from fastapi import FastAPI, UploadFile, File, HTTPException
 import numpy as np
-import tensorflow as tf
+import tensorflow as tf   # ✅ بدل ai_edge_litert
 import mediapipe as mp
 import cv2
 import json
 import tempfile
 import os
-from collections import Counter
-import requests
+import httpx
 from dotenv import load_dotenv
 
-# ================= LOAD ENV =================
 load_dotenv()
 
 # ================= CONFIG =================
-MODEL_PATH = "model.tflite"
-LABEL_MAP_PATH = "sign_to_prediction_index_map.json"
+BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
-FIXED_FRAMES = 30
-N_LANDMARKS = 543
-CONFIDENCE_HARD_FLOOR = 0.45
+MODEL_PATH = os.path.join(BASE_DIR, "artifacts/tflite/combined_model.tflite")
+LABEL_MAP_PATH = os.path.join(BASE_DIR, "artifacts/tflite/sign_to_prediction_index_map.json")
 
-app = FastAPI(title="SignSense Pro Video API")
+CONFIDENCE_THRESHOLD = 0.30
+MIN_FRAMES_FOR_SIGN = 5
+GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 
-# ================= Sliding Window =================
-class SlidingSequence:
-    def __init__(self, max_len=FIXED_FRAMES):
-        self.max_len = max_len
-        self.frames = []
+app = FastAPI(title="ASL Real-Time Style API")
 
-    def add(self, kp):
-        self.frames.append(kp)
-        if len(self.frames) > self.max_len:
-            self.frames.pop(0)
+# ================= GLOBAL MODEL =================
+interpreter = None
+input_index = None
+output_index = None
+idx_to_sign = None
 
-    def is_ready(self):
-        return len(self.frames) == self.max_len
 
-    def as_array(self):
-        return np.array(self.frames, dtype=np.float32)
+def load_model():
+    global interpreter, input_index, output_index, idx_to_sign
 
-# ================= Prediction System =================
-class PredictionSystem:
-    def __init__(self, stabilization_frames=5):
-        self.history = []
-        self.stabilization_frames = stabilization_frames
-        self.sentence_buffer = []
-        self.current_stable_word = None
+    if interpreter is None:
+        print("⏳ Loading model...")
 
-    def add_prediction(self, word, confidence):
-        if confidence >= CONFIDENCE_HARD_FLOOR:
-            self.history.append(word)
-        else:
-            self.history.append("")
+        # ✅ الحل هنا
+        interpreter = tf.lite.Interpreter(
+            model_path=MODEL_PATH
+        )
 
-        self.history = self.history[-self.stabilization_frames:]
+        interpreter.allocate_tensors()
 
-        if len(self.history) == self.stabilization_frames:
-            best, count = Counter(self.history).most_common(1)[0]
-            if count >= 3 and best and best != self.current_stable_word:
-                self.current_stable_word = best
-                self.sentence_buffer.append(best)
+        input_details = interpreter.get_input_details()
+        output_details = interpreter.get_output_details()
 
-# ================= LOAD MODEL =================
-print("⏳ Loading model...")
+        input_index = input_details[0]['index']
+        output_index = output_details[0]['index']
 
-interpreter = tf.lite.Interpreter(model_path=MODEL_PATH)
-input_details = interpreter.get_input_details()
-output_details = interpreter.get_output_details()
+        with open(LABEL_MAP_PATH) as f:
+            label_map = json.load(f)
 
-input_index = input_details[0]['index']
-output_index = output_details[0]['index']
+        idx_to_sign = {v: k for k, v in label_map.items()}
 
-try:
-    interpreter.resize_tensor_input(
-        input_index,
-        [1, FIXED_FRAMES, N_LANDMARKS, 3]
-    )
-except:
-    pass
+        print("✅ Model ready")
 
-interpreter.allocate_tensors()
 
-with open(LABEL_MAP_PATH) as f:
-    label_map = json.load(f)
-
-idx_to_sign = {v: k for k, v in label_map.items()}
-
-print("✅ Model ready")
-
+# ================= MEDIAPIPE =================
 mp_holistic = mp.solutions.holistic
 
-# ================= Helpers =================
-def softmax(x):
-    e = np.exp(x - np.max(x))
-    return e / e.sum()
 
 def extract_landmarks(results):
     def to_arr(lms, n):
         if lms:
-            return [[l.x, l.y, l.z] for l in lms.landmark]
-        return [[np.nan]*3]*n
+            return np.array([[l.x, l.y, l.z] for l in lms.landmark], dtype=np.float32)
+        return np.full((n, 3), np.nan, dtype=np.float32)
 
-    return np.concatenate([
-        to_arr(results.face_landmarks, 468),
-        to_arr(results.left_hand_landmarks, 21),
-        to_arr(results.pose_landmarks, 33),
-        to_arr(results.right_hand_landmarks, 21),
-    ])
+    face = to_arr(results.face_landmarks, 468)
+    lh = to_arr(results.left_hand_landmarks, 21)
+    pose = to_arr(results.pose_landmarks, 33)
+    rh = to_arr(results.right_hand_landmarks, 21)
 
-def call_llm_api(prompt):
-    api_key = os.getenv("GROQ_API_KEY")
-    if not api_key:
-        return "GROQ_API_KEY not found"
+    return np.concatenate([face, lh, pose, rh])
 
-    try:
-        r = requests.post(
+
+# ================= GROQ =================
+async def build_sentence_with_groq(words: list[str]) -> str:
+    if not words:
+        return ""
+
+    if not GROQ_API_KEY:
+        return " ".join(words)
+
+    prompt = (
+        f"The following words were detected from ASL signs: {', '.join(words)}. "
+        "Construct a single natural, grammatically correct English sentence using these words. "
+        "Return ONLY the sentence, no explanation."
+    )
+
+    async with httpx.AsyncClient() as client:
+        response = await client.post(
             "https://api.groq.com/openai/v1/chat/completions",
             headers={
-                "Authorization": f"Bearer {api_key}",
-                "Content-Type": "application/json"
+                "Authorization": f"Bearer {GROQ_API_KEY}",
+                "Content-Type": "application/json",
             },
             json={
                 "model": "llama-3.1-8b-instant",
-                "messages": [
-                    {
-                        "role": "system",
-                        "content": "Convert the following sign language gloss words into one simple natural English sentence. Only output the sentence."
-                    },
-                    {
-                        "role": "user",
-                        "content": prompt
-                    }
-                ],
-                "temperature": 0.2
+                "messages": [{"role": "user", "content": prompt}],
+                "max_tokens": 100,
+                "temperature": 0.3,
             },
-            timeout=20
+            timeout=10.0,
         )
 
-        r.raise_for_status()
-        return r.json()["choices"][0]["message"]["content"].strip()
+        response.raise_for_status()
+        data = response.json()
+        return data["choices"][0]["message"]["content"].strip()
 
-    except Exception as e:
-        return f"LLM Error: {str(e)}"
 
-# ================= VIDEO ENDPOINT =================
+# ================= CORE PROCESS =================
+def process_video(file_path):
+    load_model()
+
+    cap = cv2.VideoCapture(file_path)
+    if not cap.isOpened():
+        raise Exception("Video could not be opened")
+
+    sequence = []
+    sentence = []
+    is_signing = False
+    _cached_shape = None
+
+    with mp_holistic.Holistic(
+        min_detection_confidence=0.5,
+        min_tracking_confidence=0.5
+    ) as holistic:
+
+        while True:
+            ret, frame = cap.read()
+            if not ret:
+                break
+
+            rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            results = holistic.process(rgb)
+
+            hands_detected = bool(
+                results.left_hand_landmarks or results.right_hand_landmarks
+            )
+
+            landmarks = extract_landmarks(results)
+
+            if hands_detected:
+                if not is_signing:
+                    is_signing = True
+                    sequence = []
+
+                sequence.append(landmarks)
+
+            else:
+                if is_signing:
+                    is_signing = False
+
+                    if len(sequence) >= MIN_FRAMES_FOR_SIGN:
+                        input_data = np.expand_dims(
+                            np.array(sequence, dtype=np.float32), axis=0
+                        )
+
+                        if input_data.shape != _cached_shape:
+                            _cached_shape = input_data.shape
+                            interpreter.resize_tensor_input(
+                                input_index, input_data.shape
+                            )
+                            interpreter.allocate_tensors()
+
+                        interpreter.set_tensor(input_index, input_data)
+                        interpreter.invoke()
+
+                        output = interpreter.get_tensor(output_index)
+
+                        probs = np.squeeze(output)
+                        pred = int(np.argmax(probs))
+                        conf = float(probs[pred])
+
+                        if conf > CONFIDENCE_THRESHOLD:
+                            word = idx_to_sign.get(pred, str(pred))
+                            sentence.append(word)
+
+                            if len(sentence) > 6:
+                                sentence.pop(0)
+
+    cap.release()
+    return sentence
+
+
+# ================= ENDPOINT =================
 @app.post("/predict-video")
 async def predict_video(file: UploadFile = File(...)):
+    temp_path = None
 
     try:
         temp = tempfile.NamedTemporaryFile(delete=False)
         temp.write(await file.read())
         temp.close()
+        temp_path = temp.name
 
-        cap = cv2.VideoCapture(temp.name)
-
-        if not cap.isOpened():
-            return {"error": "Video could not be opened"}
-
-        sequence = SlidingSequence()
-        engine = PredictionSystem()
-
-        with mp_holistic.Holistic(
-            min_detection_confidence=0.5,
-            min_tracking_confidence=0.5
-        ) as holistic:
-
-            while True:
-                ret, frame = cap.read()
-                if not ret:
-                    break
-
-                rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                results = holistic.process(rgb)
-
-                hand_present = (
-                    results.left_hand_landmarks is not None or
-                    results.right_hand_landmarks is not None
-                )
-
-                if not hand_present:
-                    continue
-
-                kp = extract_landmarks(results)
-                sequence.add(kp)
-
-                if not sequence.is_ready():
-                    continue
-
-                inp = sequence.as_array()
-
-                if inp.shape != (FIXED_FRAMES, N_LANDMARKS, 3):
-                    continue
-
-                inp = inp[np.newaxis]
-
-                interpreter.set_tensor(input_index, inp)
-                interpreter.invoke()
-
-                out = interpreter.get_tensor(output_index)
-
-                if out.ndim == 2:
-                    logits = out[0]
-                elif out.ndim == 1:
-                    logits = out
-                else:
-                    continue
-
-                probs = softmax(logits)
-
-                if probs.ndim == 0:
-                    continue
-
-                top = int(np.argmax(probs))
-                conf = float(probs[top])
-                word = idx_to_sign.get(top, str(top))
-
-                engine.add_prediction(word, conf)
-
-        cap.release()
-        os.unlink(temp.name)
-
-        raw_sentence = " ".join(engine.sentence_buffer)
-
-        llm_sentence = None
-        if raw_sentence:
-            llm_sentence = call_llm_api(raw_sentence)
+        words = process_video(temp_path)
+        sentence = await build_sentence_with_groq(words)
 
         return {
-            "words": engine.sentence_buffer,
-            "raw_sentence": raw_sentence,
-            "llm_sentence": llm_sentence
+            "words": words,
+            "sentence": sentence,
         }
 
     except Exception as e:
-        return {"error": str(e)}
-print("API KEY:", os.getenv("GROQ_API_KEY"))
+        raise HTTPException(status_code=500, detail=str(e))
+
+    finally:
+        if temp_path and os.path.exists(temp_path):
+            os.unlink(temp_path)
