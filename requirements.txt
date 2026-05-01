@@ -1,9 +1,14 @@
 fastapi==0.110.0
 uvicorn[standard]==0.29.0
+
 numpy==1.26.4
 opencv-python-headless==4.8.1.78
 pillow>=10.4.0
+
 python-multipart==0.0.27
 python-dotenv==1.0.1
-tflite-runtime==2.14.0
 httpx==0.27.0
+
+tensorflow==2.15.0
+mediapipe==0.10.9
+protobuf==3.20.3
