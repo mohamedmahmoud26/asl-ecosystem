@@ -1,6 +1,6 @@
 from fastapi import FastAPI, UploadFile, File, HTTPException
 import numpy as np
-import tensorflow as tf   #
+import tensorflow as tf
 import mediapipe as mp
 import cv2
 import json
@@ -17,11 +17,13 @@ BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 MODEL_PATH = os.path.join(BASE_DIR, "artifacts/tflite/combined_model.tflite")
 LABEL_MAP_PATH = os.path.join(BASE_DIR, "artifacts/tflite/sign_to_prediction_index_map.json")
 
-CONFIDENCE_THRESHOLD = 0.30
+CONFIDENCE_THRESHOLD = 0.65
 MIN_FRAMES_FOR_SIGN = 5
+TARGET_FRAMES = 30
+
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 
-app = FastAPI(title="ASL Real-Time Style API")
+app = FastAPI(title="ASL Clean API")
 
 # ================= GLOBAL MODEL =================
 interpreter = None
@@ -36,11 +38,7 @@ def load_model():
     if interpreter is None:
         print("⏳ Loading model...")
 
-        # ✅ الحل هنا
-        interpreter = tf.lite.Interpreter(
-            model_path=MODEL_PATH
-        )
-
+        interpreter = tf.lite.Interpreter(model_path=MODEL_PATH)
         interpreter.allocate_tensors()
 
         input_details = interpreter.get_input_details()
@@ -65,7 +63,7 @@ def extract_landmarks(results):
     def to_arr(lms, n):
         if lms:
             return np.array([[l.x, l.y, l.z] for l in lms.landmark], dtype=np.float32)
-        return np.full((n, 3), np.nan, dtype=np.float32)
+        return np.zeros((n, 3), dtype=np.float32)  # ✅ بدل NaN
 
     face = to_arr(results.face_landmarks, 468)
     lh = to_arr(results.left_hand_landmarks, 21)
@@ -75,18 +73,19 @@ def extract_landmarks(results):
     return np.concatenate([face, lh, pose, rh])
 
 
-# ================= GROQ =================
+# ================= GROQ (FIXED) =================
 async def build_sentence_with_groq(words: list[str]) -> str:
     if not words:
         return ""
 
-    if not GROQ_API_KEY:
+    if len(words) < 2 or not GROQ_API_KEY:
         return " ".join(words)
 
     prompt = (
-        f"The following words were detected from ASL signs: {', '.join(words)}. "
-        "Construct a single natural, grammatically correct English sentence using these words. "
-        "Return ONLY the sentence, no explanation."
+        f"Words: {words}\n"
+        "ONLY rearrange these words into a correct English sentence.\n"
+        "DO NOT add, remove, or replace any word.\n"
+        "If it is not possible, return the words exactly as they are."
     )
 
     async with httpx.AsyncClient() as client:
@@ -99,8 +98,8 @@ async def build_sentence_with_groq(words: list[str]) -> str:
             json={
                 "model": "llama-3.1-8b-instant",
                 "messages": [{"role": "user", "content": prompt}],
-                "max_tokens": 100,
-                "temperature": 0.3,
+                "max_tokens": 50,
+                "temperature": 0.1,
             },
             timeout=10.0,
         )
@@ -136,8 +135,9 @@ def process_video(file_path):
             rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
             results = holistic.process(rgb)
 
-            hands_detected = bool(
-                results.left_hand_landmarks or results.right_hand_landmarks
+            hands_detected = (
+                results.left_hand_landmarks is not None or
+                results.right_hand_landmarks is not None
             )
 
             landmarks = extract_landmarks(results)
@@ -154,15 +154,20 @@ def process_video(file_path):
                     is_signing = False
 
                     if len(sequence) >= MIN_FRAMES_FOR_SIGN:
-                        input_data = np.expand_dims(
-                            np.array(sequence, dtype=np.float32), axis=0
-                        )
+                        seq = np.array(sequence, dtype=np.float32)
+
+                        # ✅ تثبيت الفريمات
+                        if len(seq) < TARGET_FRAMES:
+                            pad = np.zeros((TARGET_FRAMES - len(seq), seq.shape[1], seq.shape[2]))
+                            seq = np.concatenate([seq, pad])
+                        else:
+                            seq = seq[:TARGET_FRAMES]
+
+                        input_data = np.expand_dims(seq, axis=0)
 
                         if input_data.shape != _cached_shape:
                             _cached_shape = input_data.shape
-                            interpreter.resize_tensor_input(
-                                input_index, input_data.shape
-                            )
+                            interpreter.resize_tensor_input(input_index, input_data.shape)
                             interpreter.allocate_tensors()
 
                         interpreter.set_tensor(input_index, input_data)
@@ -176,7 +181,10 @@ def process_video(file_path):
 
                         if conf > CONFIDENCE_THRESHOLD:
                             word = idx_to_sign.get(pred, str(pred))
-                            sentence.append(word)
+
+                            # ✅ منع التكرار
+                            if not sentence or sentence[-1] != word:
+                                sentence.append(word)
 
                             if len(sentence) > 6:
                                 sentence.pop(0)
@@ -197,6 +205,10 @@ async def predict_video(file: UploadFile = File(...)):
         temp_path = temp.name
 
         words = process_video(temp_path)
+
+        # تنظيف الكلمات
+        words = list(dict.fromkeys(words))
+
         sentence = await build_sentence_with_groq(words)
 
         return {
