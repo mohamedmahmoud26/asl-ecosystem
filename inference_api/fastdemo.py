@@ -19,7 +19,7 @@ LABEL_MAP_PATH = os.path.join(BASE_DIR, "artifacts/tflite/sign_to_prediction_ind
 
 CONFIDENCE_THRESHOLD = 0.30
 MIN_FRAMES_FOR_SIGN = 5
-GROQ_API_KEY = os.getenv("api_groq")
+GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 
 app = FastAPI(title="ASL Real-Time Style API")
 
