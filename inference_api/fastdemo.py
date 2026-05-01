@@ -1,7 +1,6 @@
 from fastapi import FastAPI, UploadFile, File, HTTPException
 import numpy as np
-import tensorflow as tf   # ✅ بدل ai_edge_litert
-import mediapipe as mp
+import tflite_runtime.interpreter as tflite
 import cv2
 import json
 import tempfile
@@ -18,12 +17,11 @@ MODEL_PATH = os.path.join(BASE_DIR, "artifacts/tflite/combined_model.tflite")
 LABEL_MAP_PATH = os.path.join(BASE_DIR, "artifacts/tflite/sign_to_prediction_index_map.json")
 
 CONFIDENCE_THRESHOLD = 0.30
-MIN_FRAMES_FOR_SIGN = 5
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 
-app = FastAPI(title="ASL Real-Time Style API")
+app = FastAPI(title="ASL API (TFLite Only)")
 
-# ================= GLOBAL MODEL =================
+# ================= LOAD MODEL =================
 interpreter = None
 input_index = None
 output_index = None
@@ -36,11 +34,7 @@ def load_model():
     if interpreter is None:
         print("⏳ Loading model...")
 
-        # ✅ الحل هنا
-        interpreter = tf.lite.Interpreter(
-            model_path=MODEL_PATH
-        )
-
+        interpreter = tflite.Interpreter(model_path=MODEL_PATH)
         interpreter.allocate_tensors()
 
         input_details = interpreter.get_input_details()
@@ -57,60 +51,7 @@ def load_model():
         print("✅ Model ready")
 
 
-# ================= MEDIAPIPE =================
-mp_holistic = mp.solutions.holistic
-
-
-def extract_landmarks(results):
-    def to_arr(lms, n):
-        if lms:
-            return np.array([[l.x, l.y, l.z] for l in lms.landmark], dtype=np.float32)
-        return np.full((n, 3), np.nan, dtype=np.float32)
-
-    face = to_arr(results.face_landmarks, 468)
-    lh = to_arr(results.left_hand_landmarks, 21)
-    pose = to_arr(results.pose_landmarks, 33)
-    rh = to_arr(results.right_hand_landmarks, 21)
-
-    return np.concatenate([face, lh, pose, rh])
-
-
-# ================= GROQ =================
-async def build_sentence_with_groq(words: list[str]) -> str:
-    if not words:
-        return ""
-
-    if not GROQ_API_KEY:
-        return " ".join(words)
-
-    prompt = (
-        f"The following words were detected from ASL signs: {', '.join(words)}. "
-        "Construct a single natural, grammatically correct English sentence using these words. "
-        "Return ONLY the sentence, no explanation."
-    )
-
-    async with httpx.AsyncClient() as client:
-        response = await client.post(
-            "https://api.groq.com/openai/v1/chat/completions",
-            headers={
-                "Authorization": f"Bearer {GROQ_API_KEY}",
-                "Content-Type": "application/json",
-            },
-            json={
-                "model": "llama-3.1-8b-instant",
-                "messages": [{"role": "user", "content": prompt}],
-                "max_tokens": 100,
-                "temperature": 0.3,
-            },
-            timeout=10.0,
-        )
-
-        response.raise_for_status()
-        data = response.json()
-        return data["choices"][0]["message"]["content"].strip()
-
-
-# ================= CORE PROCESS =================
+# ================= SIMPLE PROCESS =================
 def process_video(file_path):
     load_model()
 
@@ -118,71 +59,62 @@ def process_video(file_path):
     if not cap.isOpened():
         raise Exception("Video could not be opened")
 
-    sequence = []
-    sentence = []
-    is_signing = False
-    _cached_shape = None
+    frames = []
 
-    with mp_holistic.Holistic(
-        min_detection_confidence=0.5,
-        min_tracking_confidence=0.5
-    ) as holistic:
+    while True:
+        ret, frame = cap.read()
+        if not ret:
+            break
 
-        while True:
-            ret, frame = cap.read()
-            if not ret:
-                break
-
-            rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            results = holistic.process(rgb)
-
-            hands_detected = bool(
-                results.left_hand_landmarks or results.right_hand_landmarks
-            )
-
-            landmarks = extract_landmarks(results)
-
-            if hands_detected:
-                if not is_signing:
-                    is_signing = True
-                    sequence = []
-
-                sequence.append(landmarks)
-
-            else:
-                if is_signing:
-                    is_signing = False
-
-                    if len(sequence) >= MIN_FRAMES_FOR_SIGN:
-                        input_data = np.expand_dims(
-                            np.array(sequence, dtype=np.float32), axis=0
-                        )
-
-                        if input_data.shape != _cached_shape:
-                            _cached_shape = input_data.shape
-                            interpreter.resize_tensor_input(
-                                input_index, input_data.shape
-                            )
-                            interpreter.allocate_tensors()
-
-                        interpreter.set_tensor(input_index, input_data)
-                        interpreter.invoke()
-
-                        output = interpreter.get_tensor(output_index)
-
-                        probs = np.squeeze(output)
-                        pred = int(np.argmax(probs))
-                        conf = float(probs[pred])
-
-                        if conf > CONFIDENCE_THRESHOLD:
-                            word = idx_to_sign.get(pred, str(pred))
-                            sentence.append(word)
-
-                            if len(sentence) > 6:
-                                sentence.pop(0)
+        frame = cv2.resize(frame, (224, 224))
+        frame = frame / 255.0
+        frames.append(frame)
 
     cap.release()
-    return sentence
+
+    if len(frames) == 0:
+        return []
+
+    input_data = np.expand_dims(np.array(frames, dtype=np.float32), axis=0)
+
+    interpreter.resize_tensor_input(input_index, input_data.shape)
+    interpreter.allocate_tensors()
+
+    interpreter.set_tensor(input_index, input_data)
+    interpreter.invoke()
+
+    output = interpreter.get_tensor(output_index)
+
+    probs = np.squeeze(output)
+    pred = int(np.argmax(probs))
+    conf = float(probs[pred])
+
+    if conf > CONFIDENCE_THRESHOLD:
+        return [idx_to_sign.get(pred, str(pred))]
+
+    return []
+
+
+# ================= GROQ =================
+async def build_sentence(words):
+    if not words:
+        return ""
+
+    if not GROQ_API_KEY:
+        return " ".join(words)
+
+    async with httpx.AsyncClient() as client:
+        response = await client.post(
+            "https://api.groq.com/openai/v1/chat/completions",
+            headers={"Authorization": f"Bearer {GROQ_API_KEY}"},
+            json={
+                "model": "llama-3.1-8b-instant",
+                "messages": [{"role": "user", "content": " ".join(words)}],
+            },
+        )
+
+        data = response.json()
+        return data["choices"][0]["message"]["content"]
 
 
 # ================= ENDPOINT =================
@@ -197,7 +129,7 @@ async def predict_video(file: UploadFile = File(...)):
         temp_path = temp.name
 
         words = process_video(temp_path)
-        sentence = await build_sentence_with_groq(words)
+        sentence = await build_sentence(words)
 
         return {
             "words": words,
