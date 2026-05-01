@@ -1,0 +1,14 @@
+{
+  "phases": {
+    "build": {
+      "cmds": [
+        "apt-get update",
+        "apt-get install -y libgl1 libglib2.0-0",
+        "pip install -r requirements.txt"
+      ]
+    },
+    "start": {
+      "cmd": "uvicorn inference_api.fastdemo:app --host 0.0.0.0 --port $PORT"
+    }
+  }
+}
