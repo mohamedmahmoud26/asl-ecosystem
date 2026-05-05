@@ -23,7 +23,7 @@ STABLE_FRAMES = 5
 
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 
-app = FastAPI(title="ASL Sentence API")
+app = FastAPI(title="ASL Hybrid API")
 
 # ================= MODEL =================
 interpreter = None
@@ -69,7 +69,7 @@ def extract_landmarks(results):
     return np.concatenate([face, lh, pose, rh])
 
 
-# ================= GROQ =================
+# ================= LLM =================
 async def build_sentence_with_groq(words):
     if not words:
         return ""
@@ -122,6 +122,7 @@ def process_video(file_path):
     words = []
     history = []
     last_word = None
+    frame_count = 0
 
     with mp_holistic.Holistic(
         min_detection_confidence=0.5,
@@ -133,13 +134,14 @@ def process_video(file_path):
             if not ret:
                 break
 
+            frame_count += 1
+
             rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
             results = holistic.process(rgb)
 
             landmarks = extract_landmarks(results)
             sequence.append(landmarks)
 
-            # sliding window
             if len(sequence) > TARGET_FRAMES:
                 sequence = sequence[-TARGET_FRAMES:]
 
@@ -161,9 +163,8 @@ def process_video(file_path):
             pred = int(np.argmax(probs))
             conf = float(probs[pred])
 
-            # 🔥 stability detection
+            # stability
             history.append(pred)
-
             if len(history) > STABLE_FRAMES:
                 history = history[-STABLE_FRAMES:]
 
@@ -174,8 +175,17 @@ def process_video(file_path):
                     words.append(word)
                     last_word = word
 
+                # 🔥 لو الفيديو قصير → كلمة واحدة
+                if frame_count < 60:
+                    break
+
     cap.release()
-    return words
+
+    # 🔥 final decision
+    if frame_count < 60:
+        return words[:1] if words else []
+    else:
+        return words
 
 
 # ================= ENDPOINT =================
@@ -190,7 +200,6 @@ async def predict_video(file: UploadFile = File(...)):
         temp_path = temp.name
 
         words = process_video(temp_path)
-
         sentence = await build_sentence_with_groq(words)
 
         return {
