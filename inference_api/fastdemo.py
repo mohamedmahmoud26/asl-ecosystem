@@ -18,14 +18,14 @@ MODEL_PATH = os.path.join(BASE_DIR, "artifacts/tflite/combined_model.tflite")
 LABEL_MAP_PATH = os.path.join(BASE_DIR, "artifacts/tflite/sign_to_prediction_index_map.json")
 
 CONFIDENCE_THRESHOLD = 0.65
-MIN_FRAMES_FOR_SIGN = 5
 TARGET_FRAMES = 30
+COOLDOWN_FRAMES = 15
 
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 
 app = FastAPI(title="ASL Clean API")
 
-# ================= GLOBAL MODEL =================
+# ================= MODEL =================
 interpreter = None
 input_index = None
 output_index = None
@@ -36,8 +36,6 @@ def load_model():
     global interpreter, input_index, output_index, idx_to_sign
 
     if interpreter is None:
-        print("⏳ Loading model...")
-
         interpreter = tf.lite.Interpreter(model_path=MODEL_PATH)
         interpreter.allocate_tensors()
 
@@ -52,8 +50,6 @@ def load_model():
 
         idx_to_sign = {v: k for k, v in label_map.items()}
 
-        print("✅ Model ready")
-
 
 # ================= MEDIAPIPE =================
 mp_holistic = mp.solutions.holistic
@@ -63,7 +59,7 @@ def extract_landmarks(results):
     def to_arr(lms, n):
         if lms:
             return np.array([[l.x, l.y, l.z] for l in lms.landmark], dtype=np.float32)
-        return np.zeros((n, 3), dtype=np.float32)  # ✅ بدل NaN
+        return np.zeros((n, 3), dtype=np.float32)
 
     face = to_arr(results.face_landmarks, 468)
     lh = to_arr(results.left_hand_landmarks, 21)
@@ -73,8 +69,8 @@ def extract_landmarks(results):
     return np.concatenate([face, lh, pose, rh])
 
 
-# ================= GROQ (FIXED) =================
-async def build_sentence_with_groq(words: list[str]) -> str:
+# ================= GROQ =================
+async def build_sentence_with_groq(words):
     if not words:
         return ""
 
@@ -85,7 +81,7 @@ async def build_sentence_with_groq(words: list[str]) -> str:
         f"Words: {words}\n"
         "ONLY rearrange these words into a correct English sentence.\n"
         "DO NOT add, remove, or replace any word.\n"
-        "If it is not possible, return the words exactly as they are."
+        "If not possible, return as is."
     )
 
     async with httpx.AsyncClient() as client:
@@ -98,18 +94,16 @@ async def build_sentence_with_groq(words: list[str]) -> str:
             json={
                 "model": "llama-3.1-8b-instant",
                 "messages": [{"role": "user", "content": prompt}],
-                "max_tokens": 50,
                 "temperature": 0.1,
             },
             timeout=10.0,
         )
 
-        response.raise_for_status()
         data = response.json()
         return data["choices"][0]["message"]["content"].strip()
 
 
-# ================= CORE PROCESS =================
+# ================= CORE =================
 def process_video(file_path):
     load_model()
 
@@ -119,8 +113,8 @@ def process_video(file_path):
 
     sequence = []
     sentence = []
-    is_signing = False
-    _cached_shape = None
+    last_word = None
+    cooldown = 0
 
     with mp_holistic.Holistic(
         min_detection_confidence=0.5,
@@ -135,59 +129,42 @@ def process_video(file_path):
             rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
             results = holistic.process(rgb)
 
-            hands_detected = (
-                results.left_hand_landmarks is not None or
-                results.right_hand_landmarks is not None
-            )
-
             landmarks = extract_landmarks(results)
+            sequence.append(landmarks)
 
-            if hands_detected:
-                if not is_signing:
-                    is_signing = True
-                    sequence = []
+            # Sliding window
+            if len(sequence) > TARGET_FRAMES:
+                sequence = sequence[-TARGET_FRAMES:]
 
-                sequence.append(landmarks)
+            if len(sequence) < TARGET_FRAMES:
+                continue
 
-            else:
-                if is_signing:
-                    is_signing = False
+            seq = np.array(sequence, dtype=np.float32)
+            input_data = np.expand_dims(seq, axis=0)
 
-                    if len(sequence) >= MIN_FRAMES_FOR_SIGN:
-                        seq = np.array(sequence, dtype=np.float32)
+            interpreter.resize_tensor_input(input_index, input_data.shape)
+            interpreter.allocate_tensors()
 
-                        # ✅ تثبيت الفريمات
-                        if len(seq) < TARGET_FRAMES:
-                            pad = np.zeros((TARGET_FRAMES - len(seq), seq.shape[1], seq.shape[2]))
-                            seq = np.concatenate([seq, pad])
-                        else:
-                            seq = seq[:TARGET_FRAMES]
+            interpreter.set_tensor(input_index, input_data)
+            interpreter.invoke()
 
-                        input_data = np.expand_dims(seq, axis=0)
+            output = interpreter.get_tensor(output_index)
 
-                        if input_data.shape != _cached_shape:
-                            _cached_shape = input_data.shape
-                            interpreter.resize_tensor_input(input_index, input_data.shape)
-                            interpreter.allocate_tensors()
+            probs = np.squeeze(output)
+            pred = int(np.argmax(probs))
+            conf = float(probs[pred])
 
-                        interpreter.set_tensor(input_index, input_data)
-                        interpreter.invoke()
+            # Prediction logic
+            if conf > CONFIDENCE_THRESHOLD and cooldown == 0:
+                word = idx_to_sign.get(pred, str(pred))
 
-                        output = interpreter.get_tensor(output_index)
+                if word != last_word:
+                    sentence.append(word)
+                    last_word = word
+                    cooldown = COOLDOWN_FRAMES
 
-                        probs = np.squeeze(output)
-                        pred = int(np.argmax(probs))
-                        conf = float(probs[pred])
-
-                        if conf > CONFIDENCE_THRESHOLD:
-                            word = idx_to_sign.get(pred, str(pred))
-
-                            # ✅ منع التكرار
-                            if not sentence or sentence[-1] != word:
-                                sentence.append(word)
-
-                            if len(sentence) > 6:
-                                sentence.pop(0)
+            if cooldown > 0:
+                cooldown -= 1
 
     cap.release()
     return sentence
@@ -205,9 +182,6 @@ async def predict_video(file: UploadFile = File(...)):
         temp_path = temp.name
 
         words = process_video(temp_path)
-
-        # تنظيف الكلمات
-        words = list(dict.fromkeys(words))
 
         sentence = await build_sentence_with_groq(words)
 
