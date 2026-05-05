@@ -19,10 +19,11 @@ LABEL_MAP_PATH = os.path.join(BASE_DIR, "artifacts/tflite/sign_to_prediction_ind
 
 CONFIDENCE_THRESHOLD = 0.7
 TARGET_FRAMES = 30
+STABLE_FRAMES = 5
 
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 
-app = FastAPI(title="ASL Classifier API")
+app = FastAPI(title="ASL Sentence API")
 
 # ================= MODEL =================
 interpreter = None
@@ -68,7 +69,7 @@ def extract_landmarks(results):
     return np.concatenate([face, lh, pose, rh])
 
 
-# ================= LLM =================
+# ================= GROQ =================
 async def build_sentence_with_groq(words):
     if not words:
         return ""
@@ -96,13 +97,12 @@ async def build_sentence_with_groq(words):
                 "messages": [{"role": "user", "content": prompt}],
                 "temperature": 0.1,
             },
-            timeout=10.0,
         )
 
         data = response.json()
         result = data["choices"][0]["message"]["content"].strip()
 
-        # validation (منع الهبد)
+        # 🔒 validation
         result_words = result.lower().split()
         if sorted(result_words) != sorted([w.lower() for w in words]):
             return " ".join(words)
@@ -119,8 +119,9 @@ def process_video(file_path):
         raise Exception("Video could not be opened")
 
     sequence = []
-    best_word = None
-    best_conf = 0.0
+    words = []
+    history = []
+    last_word = None
 
     with mp_holistic.Holistic(
         min_detection_confidence=0.5,
@@ -138,6 +139,7 @@ def process_video(file_path):
             landmarks = extract_landmarks(results)
             sequence.append(landmarks)
 
+            # sliding window
             if len(sequence) > TARGET_FRAMES:
                 sequence = sequence[-TARGET_FRAMES:]
 
@@ -159,17 +161,21 @@ def process_video(file_path):
             pred = int(np.argmax(probs))
             conf = float(probs[pred])
 
-            # 🔥 ناخد أعلى confidence في الفيديو كله
-            if conf > best_conf and conf > CONFIDENCE_THRESHOLD:
-                best_conf = conf
-                best_word = idx_to_sign.get(pred, str(pred))
+            # 🔥 stability detection
+            history.append(pred)
+
+            if len(history) > STABLE_FRAMES:
+                history = history[-STABLE_FRAMES:]
+
+            if history.count(pred) == STABLE_FRAMES and conf > CONFIDENCE_THRESHOLD:
+                word = idx_to_sign.get(pred, str(pred))
+
+                if word != last_word:
+                    words.append(word)
+                    last_word = word
 
     cap.release()
-
-    if best_word is None:
-        return []
-
-    return [best_word]
+    return words
 
 
 # ================= ENDPOINT =================
@@ -185,11 +191,7 @@ async def predict_video(file: UploadFile = File(...)):
 
         words = process_video(temp_path)
 
-        # لو كلمة واحدة → رجعها
-        if len(words) <= 1:
-            sentence = words[0] if words else ""
-        else:
-            sentence = await build_sentence_with_groq(words)
+        sentence = await build_sentence_with_groq(words)
 
         return {
             "words": words,
