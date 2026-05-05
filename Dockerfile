@@ -13,4 +13,5 @@ COPY . .
 RUN pip install --upgrade pip
 RUN pip install -r requirements.txt
 
-CMD sh -c "uvicorn inference_api.fastdemo:app --host 0.0.0.0 --port ${PORT:-8000}"
+# 👇 استخدم exec form + PORT env
+CMD ["uvicorn", "inference_api.fastdemo:app", "--host", "0.0.0.0", "--port", "8080"]
