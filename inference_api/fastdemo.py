@@ -19,7 +19,7 @@ LABEL_MAP_PATH = os.path.join(BASE_DIR, "artifacts/tflite/sign_to_prediction_ind
 
 CONFIDENCE_THRESHOLD = 0.65
 TARGET_FRAMES = 30
-COOLDOWN_FRAMES = 15
+STABLE_FRAMES = 5
 
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 
@@ -69,7 +69,7 @@ def extract_landmarks(results):
     return np.concatenate([face, lh, pose, rh])
 
 
-# ================= GROQ =================
+# ================= GROQ (FIXED) =================
 async def build_sentence_with_groq(words):
     if not words:
         return ""
@@ -79,9 +79,10 @@ async def build_sentence_with_groq(words):
 
     prompt = (
         f"Words: {words}\n"
-        "ONLY rearrange these words into a correct English sentence.\n"
-        "DO NOT add, remove, or replace any word.\n"
-        "If not possible, return as is."
+        "Return ONLY a correct sentence using EXACTLY these words.\n"
+        "Do NOT add any new words.\n"
+        "Do NOT explain.\n"
+        "Only return the sentence."
     )
 
     async with httpx.AsyncClient() as client:
@@ -100,7 +101,15 @@ async def build_sentence_with_groq(words):
         )
 
         data = response.json()
-        return data["choices"][0]["message"]["content"].strip()
+        result = data["choices"][0]["message"]["content"].strip()
+
+        # 🔥 validation (يمنع الهبد)
+        result_words = result.lower().split()
+
+        if sorted(result_words) != sorted([w.lower() for w in words]):
+            return " ".join(words)
+
+        return result
 
 
 # ================= CORE =================
@@ -113,8 +122,8 @@ def process_video(file_path):
 
     sequence = []
     sentence = []
+    history = []
     last_word = None
-    cooldown = 0
 
     with mp_holistic.Holistic(
         min_detection_confidence=0.5,
@@ -154,17 +163,18 @@ def process_video(file_path):
             pred = int(np.argmax(probs))
             conf = float(probs[pred])
 
-            # Prediction logic
-            if conf > CONFIDENCE_THRESHOLD and cooldown == 0:
+            # ================= STABILITY =================
+            history.append(pred)
+
+            if len(history) > STABLE_FRAMES:
+                history = history[-STABLE_FRAMES:]
+
+            if history.count(pred) == STABLE_FRAMES and conf > CONFIDENCE_THRESHOLD:
                 word = idx_to_sign.get(pred, str(pred))
 
                 if word != last_word:
                     sentence.append(word)
                     last_word = word
-                    cooldown = COOLDOWN_FRAMES
-
-            if cooldown > 0:
-                cooldown -= 1
 
     cap.release()
     return sentence
@@ -182,7 +192,6 @@ async def predict_video(file: UploadFile = File(...)):
         temp_path = temp.name
 
         words = process_video(temp_path)
-
         sentence = await build_sentence_with_groq(words)
 
         return {
