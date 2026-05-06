@@ -11,252 +11,113 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-# ================= CONFIG =================
+# ==============================================================================
+# CONFIG
+# ==============================================================================
 
-BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+MODEL_PATH = "/home/mohamed_mahmoud/asl-ecosystem/artifacts/tflite/combined_model.tflite"
 
-MODEL_PATH = os.path.join(
-    BASE_DIR,
-    "artifacts/tflite/combined_model.tflite"
-)
+LABEL_MAP_PATH = "/home/mohamed_mahmoud/asl-ecosystem/artifacts/tflite/sign_to_prediction_index_map.json"
 
-LABEL_MAP_PATH = os.path.join(
-    BASE_DIR,
-    "artifacts/tflite/sign_to_prediction_index_map.json"
-)
-
-CONFIDENCE_THRESHOLD = 0.35
-MIN_SEQUENCE_FRAMES = 10
-
-TARGET_FRAMES = 64
-
-# motion
-MOTION_THRESHOLD = 0.005
-NO_MOTION_FRAMES = 8
-
-# ================= LANDMARKS =================
-
-ROWS_PER_FRAME = 543
-
-LIP = [
-    0, 61, 185, 40, 39, 37, 267, 269, 270, 409,
-    291, 146, 91, 181, 84, 17, 314, 405, 321, 375,
-    78, 191, 80, 81, 82, 13, 312, 311, 310, 415,
-    95, 88, 178, 87, 14, 317, 402, 318, 324, 308,
-]
-
-NOSE = [1, 2, 98, 327]
-
-LHAND = list(range(468, 489))
-RHAND = list(range(522, 543))
-
-REYE = [
-    33, 7, 163, 144, 145, 153, 154, 155,
-    133, 246, 161, 160, 159, 158, 157, 173
-]
-
-LEYE = [
-    263, 249, 390, 373, 374, 380, 381, 382,
-    362, 466, 388, 387, 386, 385, 384, 398
-]
-
-POINT_LANDMARKS = (
-    LIP +
-    LHAND +
-    RHAND +
-    NOSE +
-    REYE +
-    LEYE
-)
-
-NUM_NODES = len(POINT_LANDMARKS)
-
-CHANNELS = 6 * NUM_NODES
+CONFIDENCE_THRESHOLD = 0.30
+MIN_FRAMES_FOR_SIGN = 5
 
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 
-# ================= APP =================
+# ==============================================================================
+# APP
+# ==============================================================================
 
-app = FastAPI(title="ASL Sentence API")
+app = FastAPI(title="ASL API")
 
-# ================= MODEL =================
+# ==============================================================================
+# LOAD MODEL
+# ==============================================================================
 
-interpreter = None
-input_index = None
-output_index = None
-idx_to_sign = None
-INPUT_SHAPE = None
+print("[INFO] Loading label map...")
 
+with open(LABEL_MAP_PATH, "r", encoding="utf-8") as f:
 
-def load_model():
-    global interpreter
-    global input_index
-    global output_index
-    global idx_to_sign
-    global INPUT_SHAPE
+    label_data = json.load(f)
 
-    if interpreter is None:
+    label_to_sign = {
+        int(v): k for k, v in label_data.items()
+    }
 
-        interpreter = tf.lite.Interpreter(
-            model_path=MODEL_PATH
-        )
+print("[INFO] Loading TFLite model...")
 
-        input_details = interpreter.get_input_details()
-        output_details = interpreter.get_output_details()
+interpreter = tf.lite.Interpreter(
+    model_path=MODEL_PATH
+)
 
-        INPUT_SHAPE = input_details[0]["shape"]
+interpreter.allocate_tensors()
 
-        print("MODEL INPUT SHAPE:", INPUT_SHAPE)
+input_details = interpreter.get_input_details()[0]
+output_details = interpreter.get_output_details()[0]
 
-        input_index = input_details[0]["index"]
-        output_index = output_details[0]["index"]
+_cached_shape = None
 
-        with open(LABEL_MAP_PATH) as f:
-            label_map = json.load(f)
-
-        idx_to_sign = {
-            v: k for k, v in label_map.items()
-        }
-
-        # allocate مرة واحدة بس
-        interpreter.allocate_tensors()
-
-
-# ================= MEDIAPIPE =================
+# ==============================================================================
+# MEDIAPIPE
+# ==============================================================================
 
 mp_holistic = mp.solutions.holistic
 
 
-def extract_landmarks_raw(results):
+def extract_landmarks(results):
 
-    def to_arr(lms, n):
-
-        if lms:
-            return np.array(
-                [[lm.x, lm.y, lm.z] for lm in lms.landmark],
-                dtype=np.float32
-            )
-
-        return np.full(
-            (n, 3),
-            np.nan,
+    if results.face_landmarks:
+        face = np.array(
+            [[res.x, res.y, res.z]
+             for res in results.face_landmarks.landmark],
             dtype=np.float32
         )
+    else:
+        face = np.full((468, 3), np.nan, dtype=np.float32)
 
-    face = to_arr(results.face_landmarks, 468)
-    lh = to_arr(results.left_hand_landmarks, 21)
-    pose = to_arr(results.pose_landmarks, 33)
-    rh = to_arr(results.right_hand_landmarks, 21)
-
-    return np.concatenate(
-        [face, lh, pose, rh],
-        axis=0
-    )
-
-
-# ================= PAD =================
-
-def pad_sequence(x):
-
-    T = x.shape[0]
-
-    if T < TARGET_FRAMES:
-
-        pad = np.zeros(
-            (
-                TARGET_FRAMES - T,
-                x.shape[1]
-            ),
+    if results.left_hand_landmarks:
+        lh = np.array(
+            [[res.x, res.y, res.z]
+             for res in results.left_hand_landmarks.landmark],
             dtype=np.float32
         )
+    else:
+        lh = np.full((21, 3), np.nan, dtype=np.float32)
 
-        x = np.concatenate([x, pad], axis=0)
-
-    elif T > TARGET_FRAMES:
-
-        idx = np.linspace(
-            0,
-            T - 1,
-            TARGET_FRAMES
-        ).astype(np.int32)
-
-        x = x[idx]
-
-    return x
-
-
-# ================= PREPROCESS =================
-
-def preprocess_sequence(sequence):
-
-    x = np.array(
-        sequence,
-        dtype=np.float32
-    )
-
-    # reference point
-    ref = x[:, 17:18, :]
-
-    mean = np.nanmean(
-        ref,
-        axis=(0, 1),
-        keepdims=True
-    )
-
-    if np.isnan(mean).all():
-
-        mean = np.array(
-            [[[0.5, 0.5, 0.5]]],
+    if results.pose_landmarks:
+        pose = np.array(
+            [[res.x, res.y, res.z]
+             for res in results.pose_landmarks.landmark],
             dtype=np.float32
         )
+    else:
+        pose = np.full((33, 3), np.nan, dtype=np.float32)
 
-    x_sel = x[:, POINT_LANDMARKS, :]
+    if results.right_hand_landmarks:
+        rh = np.array(
+            [[res.x, res.y, res.z]
+             for res in results.right_hand_landmarks.landmark],
+            dtype=np.float32
+        )
+    else:
+        rh = np.full((21, 3), np.nan, dtype=np.float32)
 
-    std = np.nanstd(
-        x_sel - mean,
-        axis=(0, 1),
-        keepdims=True
-    )
+    return np.concatenate([face, lh, pose, rh])
 
-    std = np.where(std == 0, 1.0, std)
+# ==============================================================================
+# LLM MEMORY
+# ==============================================================================
 
-    x_sel = (x_sel - mean) / std
-
-    # x,y only
-    x_sel = x_sel[..., :2]
-
-    T = x_sel.shape[0]
-
-    dx = np.zeros_like(x_sel)
-    dx2 = np.zeros_like(x_sel)
-
-    if T > 1:
-        dx[:-1] = x_sel[1:] - x_sel[:-1]
-
-    if T > 2:
-        dx2[:-2] = x_sel[2:] - x_sel[:-2]
-
-    x_sel = np.nan_to_num(x_sel, nan=0.0)
-    dx = np.nan_to_num(dx, nan=0.0)
-    dx2 = np.nan_to_num(dx2, nan=0.0)
-
-    x_out = np.concatenate(
-        [
-            x_sel.reshape(T, -1),
-            dx.reshape(T, -1),
-            dx2.reshape(T, -1),
-        ],
-        axis=-1
-    )
-
-    x_out = pad_sequence(x_out)
-
-    return x_out[np.newaxis, ...].astype(np.float32)
+conversation_memory = []
 
 
-# ================= LLM =================
+# ==============================================================================
+# LLM
+# ==============================================================================
 
 async def build_sentence_with_groq(words):
+
+    global conversation_memory
 
     if not words:
         return ""
@@ -267,15 +128,32 @@ async def build_sentence_with_groq(words):
     if not GROQ_API_KEY:
         return " ".join(words)
 
+    # آخر سياق فقط
+    previous_context = "\n".join(
+        conversation_memory[-3:]
+    )
+
     prompt = f"""
-Words:
+You are an assistive AI for sign language translation.
+
+Your job is ONLY to reorder words into a natural sentence.
+
+IMPORTANT RULES:
+- Use ONLY the given words
+- Do NOT add new words
+- Do NOT remove words
+- Do NOT change words
+- Preserve the exact meaning
+- Keep the sentence natural and understandable
+- Use previous conversation context only to improve ordering
+
+Previous context:
+{previous_context}
+
+Current words:
 {words}
 
-Return ONLY a grammatically correct sentence
-using EXACTLY these words.
-
-Do not add words.
-Do not explain.
+Return ONLY the reordered sentence.
 """
 
     async with httpx.AsyncClient(timeout=30.0) as client:
@@ -288,13 +166,26 @@ Do not explain.
             },
             json={
                 "model": "llama-3.1-8b-instant",
+
                 "messages": [
+                    {
+                        "role": "system",
+                        "content": (
+                            "You reorder sign-language words "
+                            "into natural sentences without "
+                            "adding or removing words."
+                        )
+                    },
                     {
                         "role": "user",
                         "content": prompt
                     }
                 ],
-                "temperature": 0.1,
+
+                # قليل جدًا عشان يقلل الهبد
+                "temperature": 0.05,
+
+                "top_p": 0.2,
             },
         )
 
@@ -304,98 +195,49 @@ Do not explain.
 
             result = data["choices"][0]["message"]["content"].strip()
 
-            result_words = result.lower().split()
+            # حماية:
+            # لو أضاف كلمات نرجع الأصل
 
-            if sorted(result_words) != sorted(
+            original_words = sorted(
                 [w.lower() for w in words]
-            ):
+            )
+
+            result_words = sorted(
+                result.lower().split()
+            )
+
+            if original_words != result_words:
+
                 return " ".join(words)
+
+            # حفظ السياق
+            conversation_memory.append(result)
+
+            # حافظ على آخر 5 جمل فقط
+            if len(conversation_memory) > 5:
+                conversation_memory = conversation_memory[-5:]
 
             return result
 
         except:
+
             return " ".join(words)
-
-
-# ================= PREDICT =================
-
-def predict_from_sequence(seq):
-
-    if len(seq) < MIN_SEQUENCE_FRAMES:
-        return None, 0
-
-    input_data = preprocess_sequence(seq)
-
-    interpreter.set_tensor(
-        input_index,
-        input_data
-    )
-
-    interpreter.invoke()
-
-    output = interpreter.get_tensor(output_index)
-
-    probs = np.squeeze(output)
-
-    pred = int(np.argmax(probs))
-
-    conf = float(probs[pred])
-
-    return pred, conf
-
-
-# ================= MOTION =================
-
-def get_hand_center(results):
-
-    points = []
-
-    for hand in [
-        results.left_hand_landmarks,
-        results.right_hand_landmarks
-    ]:
-
-        if hand:
-
-            for lm in hand.landmark:
-                points.append([lm.x, lm.y])
-
-    return np.array(points) if points else None
-
-
-def compute_motion(prev, curr):
-
-    if prev is None or curr is None:
-        return 0
-
-    if prev.shape != curr.shape:
-        return 1.0
-
-    return float(
-        np.mean(np.abs(curr - prev))
-    )
-
-
-# ================= PROCESS VIDEO =================
+# ==============================================================================
+# PROCESS VIDEO
+# ==============================================================================
 
 def process_video(file_path):
 
-    load_model()
+    global _cached_shape
 
     cap = cv2.VideoCapture(file_path)
 
     if not cap.isOpened():
         raise Exception("Cannot open video")
 
-    words = []
-
-    last_word = None
-
     sequence = []
 
-    prev_hand = None
-
-    no_motion_count = 0
+    sentence = []
 
     is_signing = False
 
@@ -404,7 +246,7 @@ def process_video(file_path):
         min_tracking_confidence=0.5
     ) as holistic:
 
-        while True:
+        while cap.isOpened():
 
             ret, frame = cap.read()
 
@@ -418,90 +260,87 @@ def process_video(file_path):
 
             results = holistic.process(rgb)
 
-            curr_hand = get_hand_center(results)
-
-            motion = compute_motion(
-                prev_hand,
-                curr_hand
+            hands_detected = bool(
+                results.left_hand_landmarks or
+                results.right_hand_landmarks
             )
 
-            prev_hand = curr_hand
+            landmarks = extract_landmarks(results)
 
-            if motion > MOTION_THRESHOLD:
+            if hands_detected:
 
-                is_signing = True
+                if not is_signing:
 
-                no_motion_count = 0
+                    is_signing = True
 
-                landmarks = extract_landmarks_raw(results)
-
-                if curr_hand is not None:
-                    sequence.append(landmarks)
-
-            elif is_signing:
-
-                no_motion_count += 1
-
-                landmarks = extract_landmarks_raw(results)
-
-                if curr_hand is not None:
-                    sequence.append(landmarks)
-
-                if no_motion_count >= NO_MOTION_FRAMES:
-
-                    pred, conf = predict_from_sequence(sequence)
-
-                    print("CONF:", conf)
-
-                    if (
-                        pred is not None
-                        and conf > CONFIDENCE_THRESHOLD
-                    ):
-
-                        word = idx_to_sign.get(
-                            pred,
-                            str(pred)
-                        )
-
-                        if word != last_word:
-
-                            words.append(word)
-
-                            last_word = word
-
-                            print("WORD:", word)
-
-                    # reset
                     sequence = []
+
+                sequence.append(landmarks)
+
+            else:
+
+                if is_signing:
 
                     is_signing = False
 
-                    no_motion_count = 0
+                    if len(sequence) >= MIN_FRAMES_FOR_SIGN:
 
-        # آخر إشارة
-        if sequence and is_signing:
+                        input_data = np.expand_dims(
+                            np.array(sequence, dtype=np.float32),
+                            axis=0
+                        )
 
-            pred, conf = predict_from_sequence(sequence)
+                        print("INPUT SHAPE:", input_data.shape)
 
-            if (
-                pred is not None
-                and conf > CONFIDENCE_THRESHOLD
-            ):
+                        # dynamic resize
+                        if input_data.shape != _cached_shape:
 
-                word = idx_to_sign.get(
-                    pred,
-                    str(pred)
-                )
+                            _cached_shape = input_data.shape
 
-                if word != last_word:
-                    words.append(word)
+                            interpreter.resize_tensor_input(
+                                input_details["index"],
+                                input_data.shape
+                            )
+
+                            interpreter.allocate_tensors()
+
+                        interpreter.set_tensor(
+                            input_details["index"],
+                            input_data
+                        )
+
+                        interpreter.invoke()
+
+                        output_data = interpreter.get_tensor(
+                            output_details["index"]
+                        )
+
+                        probabilities = np.squeeze(output_data)
+
+                        pred_index = int(np.argmax(probabilities))
+
+                        confidence = float(
+                            probabilities[pred_index]
+                        )
+
+                        print("CONF:", confidence)
+
+                        if confidence > CONFIDENCE_THRESHOLD:
+
+                            sign_name = label_to_sign[pred_index]
+
+                            sentence.append(sign_name)
+
+                            print("WORD:", sign_name)
 
     cap.release()
 
-    return words
+    return sentence
 
 
-# ================= ENDPOINT =================
+# ==============================================================================
+# ENDPOINTS
+# ==============================================================================
 
 @app.get("/")
 def home():
