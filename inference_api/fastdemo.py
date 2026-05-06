@@ -21,6 +21,11 @@ CONFIDENCE_THRESHOLD = 0.6
 TARGET_FRAMES = 30
 STABLE_FRAMES = 3
 
+# إعدادات الحركة
+MOTION_THRESHOLD = 0.02      # الحد الأدنى للحركة عشان نعتبر في إشارة
+NO_MOTION_FRAMES = 10        # عدد فريمات السكون قبل ما نقطع الإشارة
+MIN_SEQUENCE_FRAMES = 15     # أقل عدد فريمات عشان نبدأ نتوقع
+
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 
 app = FastAPI(title="ASL Sentence API FINAL")
@@ -102,7 +107,7 @@ async def build_sentence_with_groq(words):
         data = response.json()
         result = data["choices"][0]["message"]["content"].strip()
 
-        # منع الهبد
+        # منع الهبد - لو الكلمات مش نفسها ارجع الكلمات زي ما هي
         result_words = result.lower().split()
         if sorted(result_words) != sorted([w.lower() for w in words]):
             return " ".join(words)
@@ -118,10 +123,58 @@ def process_video(file_path):
     if not cap.isOpened():
         raise Exception("Video could not be opened")
 
-    sequence = []
     words = []
     history = []
     last_word = None
+
+    sequence = []
+    prev_hand_landmarks = None
+    no_motion_count = 0
+    is_signing = False
+
+    def get_hand_center(results):
+        """استخرج نقاط الإيدين عشان نحسب الحركة"""
+        points = []
+        for hand in [results.left_hand_landmarks, results.right_hand_landmarks]:
+            if hand:
+                for lm in hand.landmark:
+                    points.append([lm.x, lm.y])
+        return np.array(points) if points else None
+
+    def compute_motion(prev, curr):
+        """احسب مقدار الحركة بين فريمين"""
+        if prev is None or curr is None:
+            return 0
+        if prev.shape != curr.shape:
+            # لو الشكل اتغير (ظهرت إيد أو اختفت) اعتبرها حركة
+            return 1.0
+        return float(np.mean(np.abs(curr - prev)))
+
+    def predict_from_sequence(seq):
+        """خد sequence وارجع الكلمة والـ confidence"""
+        if len(seq) < MIN_SEQUENCE_FRAMES:
+            return None, 0
+
+        # لو أقل من TARGET_FRAMES، اعمل padding بأول فريم
+        if len(seq) < TARGET_FRAMES:
+            pad = [seq[0]] * (TARGET_FRAMES - len(seq))
+            seq_padded = pad + list(seq)
+        else:
+            seq_padded = seq[-TARGET_FRAMES:]
+
+        input_data = np.expand_dims(np.array(seq_padded, dtype=np.float32), axis=0)
+
+        interpreter.resize_tensor_input(input_index, input_data.shape)
+        interpreter.allocate_tensors()
+        interpreter.set_tensor(input_index, input_data)
+        interpreter.invoke()
+
+        output = interpreter.get_tensor(output_index)
+        probs = np.squeeze(output)
+        pred = int(np.argmax(probs))
+        conf = float(probs[pred])
+
+        return pred, conf
 
     with mp_holistic.Holistic(
         min_detection_confidence=0.5,
@@ -136,44 +189,52 @@ def process_video(file_path):
             rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
             results = holistic.process(rgb)
 
-            landmarks = extract_landmarks(results)
-            sequence.append(landmarks)
+            curr_hand = get_hand_center(results)
+            motion = compute_motion(prev_hand_landmarks, curr_hand)
+            prev_hand_landmarks = curr_hand
 
-            # sliding window
-            if len(sequence) > TARGET_FRAMES:
-                sequence = sequence[-TARGET_FRAMES:]
+            if motion > MOTION_THRESHOLD:
+                # ✋ في حركة → ابدأ أو كمل تسجيل الإشارة
+                is_signing = True
+                no_motion_count = 0
+                landmarks = extract_landmarks(results)
+                sequence.append(landmarks)
 
-            if len(sequence) < TARGET_FRAMES:
-                continue
+            elif is_signing:
+                # 🤚 السكون بدأ بعد إشارة → كمل شوية وبعدين توقع
+                no_motion_count += 1
+                landmarks = extract_landmarks(results)
+                sequence.append(landmarks)
 
-            seq = np.array(sequence, dtype=np.float32)
-            input_data = np.expand_dims(seq, axis=0)
+                if no_motion_count >= NO_MOTION_FRAMES:
+                    # ✅ الإشارة خلصت → ابدأ التوقع
+                    pred, conf = predict_from_sequence(sequence)
 
-            interpreter.resize_tensor_input(input_index, input_data.shape)
-            interpreter.allocate_tensors()
+                    if pred is not None and conf > CONFIDENCE_THRESHOLD:
+                        word = idx_to_sign.get(pred, str(pred))
 
-            interpreter.set_tensor(input_index, input_data)
-            interpreter.invoke()
+                        history.append(pred)
+                        if len(history) > STABLE_FRAMES:
+                            history = history[-STABLE_FRAMES:]
 
-            output = interpreter.get_tensor(output_index)
+                        # ضيف الكلمة بس لو مش تكرار
+                        if word != last_word:
+                            words.append(word)
+                            last_word = word
 
-            probs = np.squeeze(output)
-            pred = int(np.argmax(probs))
-            conf = float(probs[pred])
+                    # 🔄 Reset عشان الإشارة الجاية
+                    sequence = []
+                    history = []
+                    is_signing = False
+                    no_motion_count = 0
 
-            # ================= STABILITY =================
-            history.append(pred)
-
-            if len(history) > STABLE_FRAMES:
-                history = history[-STABLE_FRAMES:]
-
-            if history.count(pred) == STABLE_FRAMES and conf > CONFIDENCE_THRESHOLD:
+        # لو الفيديو خلص وفيه sequence لسه معلقة (إشارة من غير سكون في الآخر)
+        if sequence and is_signing:
+            pred, conf = predict_from_sequence(sequence)
+            if pred is not None and conf > CONFIDENCE_THRESHOLD:
                 word = idx_to_sign.get(pred, str(pred))
-
-                # منع التكرار
                 if word != last_word:
                     words.append(word)
-                    last_word = word
 
     cap.release()
     return words
