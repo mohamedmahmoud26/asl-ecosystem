@@ -17,13 +17,13 @@ BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 MODEL_PATH = os.path.join(BASE_DIR, "artifacts/tflite/combined_model.tflite")
 LABEL_MAP_PATH = os.path.join(BASE_DIR, "artifacts/tflite/sign_to_prediction_index_map.json")
 
-CONFIDENCE_THRESHOLD = 0.7
+CONFIDENCE_THRESHOLD = 0.6
 TARGET_FRAMES = 30
-STABLE_FRAMES = 5
+STABLE_FRAMES = 3
 
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 
-app = FastAPI(title="ASL Hybrid API")
+app = FastAPI(title="ASL Sentence API FINAL")
 
 # ================= MODEL =================
 interpreter = None
@@ -102,7 +102,7 @@ async def build_sentence_with_groq(words):
         data = response.json()
         result = data["choices"][0]["message"]["content"].strip()
 
-        # 🔒 validation
+        # منع الهبد
         result_words = result.lower().split()
         if sorted(result_words) != sorted([w.lower() for w in words]):
             return " ".join(words)
@@ -122,7 +122,6 @@ def process_video(file_path):
     words = []
     history = []
     last_word = None
-    frame_count = 0
 
     with mp_holistic.Holistic(
         min_detection_confidence=0.5,
@@ -134,14 +133,13 @@ def process_video(file_path):
             if not ret:
                 break
 
-            frame_count += 1
-
             rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
             results = holistic.process(rgb)
 
             landmarks = extract_landmarks(results)
             sequence.append(landmarks)
 
+            # sliding window
             if len(sequence) > TARGET_FRAMES:
                 sequence = sequence[-TARGET_FRAMES:]
 
@@ -163,29 +161,22 @@ def process_video(file_path):
             pred = int(np.argmax(probs))
             conf = float(probs[pred])
 
-            # stability
+            # ================= STABILITY =================
             history.append(pred)
+
             if len(history) > STABLE_FRAMES:
                 history = history[-STABLE_FRAMES:]
 
             if history.count(pred) == STABLE_FRAMES and conf > CONFIDENCE_THRESHOLD:
                 word = idx_to_sign.get(pred, str(pred))
 
+                # منع التكرار
                 if word != last_word:
                     words.append(word)
                     last_word = word
 
-                # 🔥 لو الفيديو قصير → كلمة واحدة
-                if frame_count < 60:
-                    break
-
     cap.release()
-
-    # 🔥 final decision
-    if frame_count < 60:
-        return words[:1] if words else []
-    else:
-        return words
+    return words
 
 
 # ================= ENDPOINT =================
@@ -200,6 +191,7 @@ async def predict_video(file: UploadFile = File(...)):
         temp_path = temp.name
 
         words = process_video(temp_path)
+
         sentence = await build_sentence_with_groq(words)
 
         return {
