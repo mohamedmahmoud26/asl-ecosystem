@@ -15,9 +15,11 @@ load_dotenv()
 # CONFIG
 # ==============================================================================
 
-MODEL_PATH = "../artifacts/tflite/combined_model.tflite"
+MODEL_PATH = "artifacts/tflite/combined_model.tflite"
 
-LABEL_MAP_PATH = "../artifacts/tflite/sign_to_prediction_index_map.json"
+LABEL_MAP_PATH = "artifacts/tflite/sign_to_prediction_index_map.json"
+
+
 CONFIDENCE_THRESHOLD = 0.30
 MIN_FRAMES_FOR_SIGN = 5
 
